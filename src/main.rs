@@ -119,9 +119,9 @@ fn load_msgpack(filename: String) -> eyre::Result<IndexedData> {
     Ok(rmp_serde::decode::from_read(rd)?)
 }
 
-fn run_search(data: &IndexedData, terms: Vec<String>) -> Vec<(DocumentId, f64)> {
+fn run_search(data: &IndexedData, terms: Vec<&str>) -> Vec<(DocumentId, f64)> {
     let mut counter: HashMap<u32, f64> = HashMap::new();
-    for term in &terms {
+    for term in terms {
         if let Some(td) = data.term_data.get(term) {
             for (doc, app) in td.term_docs.iter() {
                 let x = counter.entry(*doc).or_insert(0.0);
@@ -148,6 +148,7 @@ struct Greeting {
 struct SearchResult {
     matches: Vec<SearchMatch>,
     total: usize,
+    time: u128,
 }
 
 #[derive(Serialize)]
@@ -175,14 +176,63 @@ fn search(
     req: Json<SearchData>,
     server_state: &State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<SearchResult>, String> {
-    let terms = req.terms.clone();
+    let start = Instant::now();
+    let server_state = server_state
+        .read()
+        .map_err(|err| format!("Error: {err:#}"))?;
+    let matches: Vec<SearchMatch> = run_search(
+        &server_state.index,
+        req.terms.iter().map(AsRef::as_ref).collect(),
+    )
+    .iter()
+    .filter(|(_, score)| *score > req.min_score.unwrap_or(0.0))
+    .take(req.max_length.unwrap_or(usize::MAX))
+    .map(|(doc, score)| SearchMatch {
+        md5: doc.clone(),
+        score: *score,
+    })
+    .collect();
+    Ok(Json(SearchResult {
+        total: matches.len(),
+        matches,
+        time: start.elapsed().as_millis(),
+    }))
+}
+
+use rocket::form::Form;
+use rocket::fs::TempFile;
+
+#[derive(FromForm)]
+struct Upload<'r> {
+    file: TempFile<'r>,
+    max_length: Option<usize>,
+    min_score: Option<f64>,
+}
+
+#[post("/search_by_file", data = "<upload>")]
+fn search_by_file(
+    upload: Form<Upload<'_>>,
+    server_state: &State<Arc<RwLock<ServerState>>>,
+) -> Result<Json<SearchResult>, String> {
+    let start = Instant::now();
+    let file = File::open(upload.file.path().unwrap()).unwrap();
+    let reader = BufReader::new(file);
+    let mut zip = zip::ZipArchive::new(reader).unwrap();
+
+    let mut filenames = String::new();
+    for i in 0..zip.len() {
+        filenames.push_str(zip.by_index(i).unwrap().name());
+        filenames.push('/');
+    }
+    let terms = filenames.split('/').collect::<Vec<&str>>();
+
     let server_state = server_state
         .read()
         .map_err(|err| format!("Error: {err:#}"))?;
     let matches: Vec<SearchMatch> = run_search(&server_state.index, terms)
         .iter()
-        .filter(|(_, score)| *score > req.min_score.unwrap_or(0.0))
-        .take(req.max_length.unwrap_or(usize::MAX))
+        .filter(|(_, score)| *score > upload.min_score.filter(|x| !x.is_nan()).unwrap_or(0.0))
+        .take(upload.max_length.unwrap_or(usize::MAX))
         .map(|(doc, score)| SearchMatch {
             md5: doc.clone(),
             score: *score,
@@ -191,6 +241,7 @@ fn search(
     Ok(Json(SearchResult {
         total: matches.len(),
         matches,
+        time: start.elapsed().as_millis(),
     }))
 }
 
@@ -213,7 +264,7 @@ async fn main() -> eyre::Result<()> {
         let server_state = Arc::new(RwLock::new(ServerState { index: msg_data }));
         rocket::build()
             .manage(server_state)
-            .mount("/", routes![index, search])
+            .mount("/", routes![index, search, search_by_file])
             .mount("/dashboard", FileServer::from("static"))
             .ignite()
             .await?
@@ -238,10 +289,7 @@ fn save_msgpack(data_filename: &str, msgpack_file: &str) -> eyre::Result<()> {
     println!("there are {} term-docid pairs", pair_count);
 
     let start = Instant::now();
-    let search_args = "lombok,AUTHORS,README.md"
-        .split(',')
-        .map(|x| x.to_string())
-        .collect();
+    let search_args = "lombok,AUTHORS,README.md".split(',').collect();
     let matches = run_search(&data, search_args);
     println!(
         "search found {} matches in {:.2}s",
